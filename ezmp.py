@@ -88,8 +88,7 @@ class background_ctx():
 			sys.settrace(lambda *args, **keys: None)
 			frame = sys._getframe(1)
 			frame.f_trace = self.trace
-		else:
-			return self
+		return self
 
 	def trace(self, frame, event, arg): #pylint:disable=no-self-use
 		raise EZMPSkip()
