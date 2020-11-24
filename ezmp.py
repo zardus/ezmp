@@ -1,4 +1,5 @@
 import contextlib
+import traceback
 import logging
 import atexit
 import sys
@@ -93,36 +94,44 @@ class background_ctx():
 	def trace(self, frame, event, arg): #pylint:disable=no-self-use
 		raise EZMPSkip()
 
-	def __exit__(self, type, value, traceback): #pylint:disable=inconsistent-return-statements,redefined-builtin
+	def __exit__(self, type, value, tb): #pylint:disable=inconsistent-return-statements,redefined-builtin
 		if not self.is_parent:
-			os.kill(os.getpid(), 9)
+			if type is not None:
+				traceback.print_exception(type, value, tb)
+			mypid = os.getpid()
+			_LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, mypid)
+			os.kill(mypid, 9)
 
 		if self.is_parent and self.timeout:
 			time.sleep(self.timeout)
-			self._terminate_workers()
-			self._wait_workers()
+			_LOG.debug("Timeout reached. Terminating workers.")
+			self.terminate()
 
 		if self.is_parent and self._wait:
-			for c in self.worker_pids:
-				os.waitpid(c, 0)
+			_LOG.debug("Waiting for workers.")
+			self.wait()
 
 		if type is None:
 			return
 		if issubclass(type, EZMPSkip):
 			return True
 
-	def _terminate_workers(self):
+	def terminate(self):
 		for c in self.worker_pids:
-			os.kill(c, 9)
+			try:
+				os.kill(c, 9)
+			except ProcessLookupError:
+				pass
+		self.wait()
 
-	def _wait_workers(self):
+	def wait(self):
 		for c in self.worker_pids:
-			os.waitpid(c, 0)
+			try:
+				os.waitpid(c, 0)
+			except ChildProcessError:
+				pass
+		self.worker_pids = [ ]
 
-	def cleanup(self):
-		if not self._wait and not self.timeout:
-			self._terminate_workers()
-			self._wait_workers()
 
 atexit.register(cleanup)
 
