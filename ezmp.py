@@ -15,7 +15,6 @@ parent_pid = os.getpid()
 
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.DEBUG)
-logging.basicConfig()
 
 def backgrounded(func):
 	def _backgrounded(): #pylint:disable=inconsistent-return-statements
