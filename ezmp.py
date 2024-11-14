@@ -74,10 +74,11 @@ def wait():
 		t.wait()
 
 class Task():
-	def __init__(self, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False): #pylint:disable=redefined-outer-name
+	def __init__(self, noop=False, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False): #pylint:disable=redefined-outer-name
 		"""
 		Conditionally runs inner code.
 
+		:param noop: Literally pretend that ezmp does not exist.
 		:param run_parent: Run the code as the parent as well (default False)
 		:param workers: Number of workers (default 1)
 		:param wait: Wait for completion (default False)
@@ -100,10 +101,15 @@ class Task():
 		self.worker_id = -1
 		self.worker_pid = None
 		self.buffer_output = buffer_output
+		self.noop = noop
 
-		active_tasks.append(self)
+		if not noop:
+			active_tasks.append(self)
 
 	def __enter__(self):
+		if self.noop:
+			return self
+
 		assert self.is_parent is not False
 
 		self.is_parent = True
@@ -137,6 +143,9 @@ class Task():
 		raise EZMPSkip()
 
 	def __exit__(self, exc_type, value, tb): #pylint:disable=inconsistent-return-statements,redefined-builtin
+		if self.noop:
+			return
+
 		if not self.is_parent:
 			signal.signal(signal.SIGUSR1, signal.SIG_IGN)
 			signal.signal(signal.SIGTERM, signal.SIG_IGN)

@@ -113,7 +113,14 @@ def test_stress():
 	t.terminate()
 	assert not psutil.Process(os.getpid()).children()
 
+def test_noop():
+	a = 1
+	with ezmp.Task(noop=True):
+		a = 2
+	assert a == 2
+
 if __name__ == '__main__':
 	test_sleep()
 	test_context_manager()
 	test_stress()
+	test_noop()

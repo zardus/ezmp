@@ -18,6 +18,10 @@ with ezmp.Task(workers=3) as c:
     print(f"Worker {c.worker_id} reporting!")
 
 ezmp.wait()
+
+# for simple turning off of ezmp
+with ezmp.Task(noop=True):
+    print("This runs 100% normally in the parent.")
 ```
 
 Other useful decorators: `@loop`, `@suppress(Exception)`
