@@ -12,8 +12,8 @@ task_pid = background_task()
 print("Background task is running!")
 os.waitpid(task_pid, 0)
 
-with background_ctx(workers=3) as c:
-	print(f"Worker {c.worker_id} reporting!")
+with Task(workers=3) as c:
+    print(f"Worker {c.worker_id} reporting!")
 ```
 
 Other useful decorators: `@loop`, `@suppress(Exception)`

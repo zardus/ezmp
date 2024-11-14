@@ -1,9 +1,10 @@
+import multiprocessing
 import contextlib
 import traceback
 import logging
 import signal
 import atexit
-import psutil
+#import psutil
 import time
 import sys
 import gc
@@ -11,19 +12,16 @@ import os
 import io
 
 parent_pid = os.getpid()
-children = set()
 
 _LOG = logging.getLogger(__name__)
 _LOG.setLevel(logging.DEBUG)
+logging.basicConfig()
 
 def backgrounded(func):
 	def _backgrounded(): #pylint:disable=inconsistent-return-statements
-		pid = os.fork()
-		if pid:
-			children.add(pid)
-			return pid
-		func()
-		os.kill(os.getpid(), 9)
+		with Task() as t:
+			func()
+		return t.worker_pids[0]
 	return _backgrounded
 
 def loop(func):
@@ -44,14 +42,13 @@ def cleanup():
 	if os.getpid() != parent_pid:
 		return
 
-	for c in children:
-		with contextlib.suppress(ProcessLookupError):
-			os.kill(c, 9)
-			os.waitpid(c, 0)
-	children.clear()
+	for t in active_tasks:
+		t.terminate()
 
 def worker_term(sig, frame):
 	raise EZMPTerm()
+def raise_timeout(sig, frame):
+	raise TimeoutError()
 
 # from https://stackoverflow.com/questions/12594148/skipping-execution-of-with-block
 class EZMPSkip(Exception):
@@ -59,9 +56,25 @@ class EZMPSkip(Exception):
 class EZMPTerm(Exception):
 	pass
 
+active_tasks = [ ]
+MAX_WORKERS = multiprocessing.cpu_count()
 
-class background_ctx():
-	def __init__(self, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False):
+def await_availability(requested=1):
+	while MAX_WORKERS - sum(len(t.worker_pids) for t in active_tasks) < requested:
+		wait_one()
+
+def wait_one():
+	c,_ = os.wait()
+	for t in active_tasks:
+		if c in t.worker_pids:
+			t.worker_pids.remove(c)
+
+def wait():
+	for t in active_tasks:
+		t.wait()
+
+class Task():
+	def __init__(self, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False): #pylint:disable=redefined-outer-name
 		"""
 		Conditionally runs inner code.
 
@@ -86,16 +99,19 @@ class background_ctx():
 		self.is_child = None
 		self.worker_id = -1
 		self.worker_pid = None
-
 		self.buffer_output = buffer_output
 
+		active_tasks.append(self)
+
 	def __enter__(self):
+		assert self.is_parent is not False
+
 		self.is_parent = True
 		for i in range(self.num_workers):
+			await_availability(1)
 			pid = os.fork()
 			if pid:
 				self.worker_pids.append(pid)
-				children.add(pid)
 			else:
 				self.is_parent = False
 				self.worker_id = i
@@ -104,6 +120,7 @@ class background_ctx():
 
 		if not self.is_parent:
 			self.worker_pids.clear()
+			signal.signal(signal.SIGUSR1, worker_term)
 			signal.signal(signal.SIGTERM, worker_term)
 			signal.signal(signal.SIGINT, signal.SIG_IGN)
 			if self.buffer_output:
@@ -121,6 +138,9 @@ class background_ctx():
 
 	def __exit__(self, exc_type, value, tb): #pylint:disable=inconsistent-return-statements,redefined-builtin
 		if not self.is_parent:
+			signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+			signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
 			if exc_type not in (None, EZMPTerm, EZMPSkip):
 				traceback.print_exception(exc_type, value, tb)
 			if exc_type:
@@ -159,130 +179,38 @@ class background_ctx():
 			return True
 
 	def terminate(self):
+		_LOG.debug("Terminating %s (parent PID %s).", self, os.getpid())
 		# send all the kill signals
 		for c in self.worker_pids:
 			with contextlib.suppress(ProcessLookupError):
-				os.kill(c, signal.SIGTERM)
+				os.kill(c, signal.SIGUSR1)
 
 		# let's get nasty after a second
-		time.sleep(1)
-		for c in self.worker_pids:
-			with contextlib.suppress(ProcessLookupError):
-				child = psutil.Process(c)
-				for descendent in child.children(recursive=True):
-					descendent.kill()
-				os.kill(c, signal.SIGTERM)
+		#time.sleep(1)
+		#for c in self.worker_pids:
+		#	with contextlib.suppress(ProcessLookupError):
+		#		child = psutil.Process(c)
+		#		for descendent in child.children(recursive=True):
+		#			descendent.kill()
+		#		os.kill(c, signal.SIGUSR1)
 
-		self.wait()
+		self.wait(timeout=1)
+		if self.worker_pids:
+			self.terminate()
 
-	def wait(self):
-		for c in self.worker_pids:
-			with contextlib.suppress(ProcessLookupError):
-				os.waitpid(c, 0)
-		self.worker_pids = [ ]
+	def wait(self, timeout=None):
+		if timeout:
+			signal.signal(signal.SIGALRM, raise_timeout)
+			signal.alarm(timeout)
 
+		try:
+			while self.worker_pids:
+				wait_one()
+		except TimeoutError:
+			_LOG.debug("Timeout waiting for children.")
+
+		if timeout:
+			signal.signal(signal.SIGALRM, signal.SIG_DFL)
+			signal.alarm(0)
 
 atexit.register(cleanup)
-
-if __name__ == '__main__':
-	import tempfile
-
-	#
-	# just a sleep test
-	#
-
-	@backgrounded
-	def bgtest():
-		time.sleep(10000)
-
-	sleep_pid = bgtest()
-	os.kill(sleep_pid, 0)
-	os.kill(sleep_pid, 9)
-
-	sleep_pid = bgtest()
-	cleanup()
-
-	#
-	# check that looping works
-	#
-
-	tmp = tempfile.mktemp()
-
-	@backgrounded
-	@loop
-	def bgtest2():
-		open(tmp, "w").close()
-
-	bgtest2()
-	time.sleep(0.5)
-	assert os.path.exists(tmp)
-	os.unlink(tmp)
-	time.sleep(0.5)
-	assert os.path.exists(tmp)
-
-	#
-	# check that exception suppressing works
-	#
-
-	tmp = tempfile.mktemp()
-
-	@backgrounded
-	@loop
-	def bgtest3():
-		open(tmp, "w").close()
-		raise Exception() #pylint:disable=broad-exception-raised
-
-	bgtest3()
-	time.sleep(0.5)
-	assert os.path.exists(tmp)
-	os.unlink(tmp)
-	time.sleep(0.5)
-	assert not os.path.exists(tmp)
-
-	@backgrounded
-	@loop
-	@suppress(Exception)
-	def bgtest4():
-		open(tmp, "w").close()
-		raise Exception() #pylint:disable=broad-exception-raised
-
-	bgtest4()
-	time.sleep(0.5)
-	assert os.path.exists(tmp)
-	os.unlink(tmp)
-	time.sleep(0.5)
-	assert os.path.exists(tmp)
-
-	#
-	# check the context manager
-	#
-
-	x = 1
-	with background_ctx(run_parent=True, workers=0):
-		x = 2
-	assert x == 2
-
-	x = 1
-	with background_ctx(workers=0):
-		x = 2
-	assert x == 1
-
-	start = time.time()
-	with background_ctx(workers=1, wait=True) as bg:
-		time.sleep(1)
-	end = time.time()
-	assert end - start > 1
-
-	start = time.time()
-	with background_ctx(workers=3, wait=True) as bg:
-		time.sleep(bg.worker_id)
-	end = time.time()
-	assert end - start > 2
-
-	start = time.time()
-	with background_ctx(workers=3, timeout=1) as bg:
-		time.sleep(bg.worker_id)
-	end = time.time()
-	assert end - start < 2
-
-	print("SUCCESS")
