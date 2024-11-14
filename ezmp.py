@@ -1,9 +1,14 @@
 import contextlib
 import traceback
 import logging
+import signal
 import atexit
+import psutil
+import time
 import sys
+import gc
 import os
+import io
 
 parent_pid = os.getpid()
 children = set()
@@ -40,14 +45,23 @@ def cleanup():
 		return
 
 	for c in children:
-		os.kill(c, 9)
-		os.waitpid(c, 0)
+		with contextlib.suppress(ProcessLookupError):
+			os.kill(c, 9)
+			os.waitpid(c, 0)
 	children.clear()
 
+def worker_term(sig, frame):
+	raise EZMPTerm()
+
 # from https://stackoverflow.com/questions/12594148/skipping-execution-of-with-block
-class EZMPSkip(Exception): pass
+class EZMPSkip(Exception):
+	pass
+class EZMPTerm(Exception):
+	pass
+
+
 class background_ctx():
-	def __init__(self, run_parent=False, wait=False, workers=1, timeout=None):
+	def __init__(self, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False):
 		"""
 		Conditionally runs inner code.
 
@@ -55,6 +69,7 @@ class background_ctx():
 		:param workers: Number of workers (default 1)
 		:param wait: Wait for completion (default False)
 		:param timeout: Timeout before workers are terminated (default None)
+		:param buffer_output: Buffer stdout and print it out when the worker exits.
 
 		The timeout argument is mutually exclusive with wait and run_parent.
 		"""
@@ -70,6 +85,9 @@ class background_ctx():
 		self.is_parent = None
 		self.is_child = None
 		self.worker_id = -1
+		self.worker_pid = None
+
+		self.buffer_output = buffer_output
 
 	def __enter__(self):
 		self.is_parent = True
@@ -77,13 +95,20 @@ class background_ctx():
 			pid = os.fork()
 			if pid:
 				self.worker_pids.append(pid)
+				children.add(pid)
 			else:
 				self.is_parent = False
 				self.worker_id = i
+				self.worker_pid = os.getpid()
 				break
 
 		if not self.is_parent:
 			self.worker_pids.clear()
+			signal.signal(signal.SIGTERM, worker_term)
+			signal.signal(signal.SIGINT, signal.SIG_IGN)
+			if self.buffer_output:
+				sys.stdout = io.StringIO()
+				sys.stderr = sys.stdout
 
 		if self.is_parent and not self._run_parent:
 			sys.settrace(lambda *args, **keys: None)
@@ -91,45 +116,69 @@ class background_ctx():
 			frame.f_trace = self.trace
 		return self
 
-	def trace(self, frame, event, arg): #pylint:disable=no-self-use
+	def trace(self, frame, event, arg):
 		raise EZMPSkip()
 
-	def __exit__(self, type, value, tb): #pylint:disable=inconsistent-return-statements,redefined-builtin
+	def __exit__(self, exc_type, value, tb): #pylint:disable=inconsistent-return-statements,redefined-builtin
 		if not self.is_parent:
-			if type is not None:
-				traceback.print_exception(type, value, tb)
-			mypid = os.getpid()
-			_LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, mypid)
-			os.kill(mypid, 9)
+			if exc_type not in (None, EZMPTerm, EZMPSkip):
+				traceback.print_exception(exc_type, value, tb)
+			if exc_type:
+				_LOG.debug("Worker ID %d PID %d got exception type %s", self.worker_id, self.worker_pid, exc_type)
+				# deallocate stuff hanging on the exception context
+				del exc_type
+				gc.collect()
+
+			if self.buffer_output:
+				print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
+			_LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
+			os.kill(self.worker_pid, 9)
 
 		if self.is_parent and self.timeout:
-			time.sleep(self.timeout)
-			_LOG.debug("Timeout reached. Terminating workers.")
+			try:
+				time.sleep(self.timeout)
+				_LOG.debug("Timeout reached. Terminating workers.")
+			except Exception: #pylint:disable=broad-exception-caught
+				traceback.print_exc()
+				_LOG.debug("Exception received. Terminating workers.")
+
 			self.terminate()
 
 		if self.is_parent and self._wait:
 			_LOG.debug("Waiting for workers.")
-			self.wait()
+			try:
+				self.wait()
+			except: #pylint:disable=bare-except
+				traceback.print_exc()
+				_LOG.debug("Exception received. Terminating workers.")
+				self.terminate()
 
-		if type is None:
+		if exc_type is None:
 			return
-		if issubclass(type, EZMPSkip):
+		if issubclass(exc_type, EZMPSkip):
 			return True
 
 	def terminate(self):
+		# send all the kill signals
 		for c in self.worker_pids:
-			try:
-				os.kill(c, 9)
-			except ProcessLookupError:
-				pass
+			with contextlib.suppress(ProcessLookupError):
+				os.kill(c, signal.SIGTERM)
+
+		# let's get nasty after a second
+		time.sleep(1)
+		for c in self.worker_pids:
+			with contextlib.suppress(ProcessLookupError):
+				child = psutil.Process(c)
+				for descendent in child.children(recursive=True):
+					descendent.kill()
+				os.kill(c, signal.SIGTERM)
+
 		self.wait()
 
 	def wait(self):
 		for c in self.worker_pids:
-			try:
+			with contextlib.suppress(ProcessLookupError):
 				os.waitpid(c, 0)
-			except ChildProcessError:
-				pass
 		self.worker_pids = [ ]
 
 
@@ -137,7 +186,6 @@ atexit.register(cleanup)
 
 if __name__ == '__main__':
 	import tempfile
-	import time
 
 	#
 	# just a sleep test
@@ -182,7 +230,7 @@ if __name__ == '__main__':
 	@loop
 	def bgtest3():
 		open(tmp, "w").close()
-		raise Exception()
+		raise Exception() #pylint:disable=broad-exception-raised
 
 	bgtest3()
 	time.sleep(0.5)
@@ -196,7 +244,7 @@ if __name__ == '__main__':
 	@suppress(Exception)
 	def bgtest4():
 		open(tmp, "w").close()
-		raise Exception()
+		raise Exception() #pylint:disable=broad-exception-raised
 
 	bgtest4()
 	time.sleep(0.5)
