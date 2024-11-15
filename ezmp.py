@@ -59,7 +59,8 @@ active_tasks = [ ]
 MAX_WORKERS = multiprocessing.cpu_count()
 
 def await_availability(requested=1):
-    while MAX_WORKERS - sum(len(t.worker_pids) for t in active_tasks) < requested:
+    while ( available := MAX_WORKERS - sum(len(t.worker_pids) for t in active_tasks) ) < requested:
+        _LOG.debug("Waiting for availability: %s/%s", available, requested)
         wait_one()
 
 def wait_one():
@@ -119,6 +120,7 @@ class Task():
             except KeyboardInterrupt:
                 self.terminate()
                 raise
+            _LOG.debug("Task %s starting worker.", self)
             pid = os.fork()
             if pid:
                 self.worker_pids.append(pid)
@@ -205,7 +207,7 @@ class Task():
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(c, signal.SIGUSR1)
 
-            self.wait(timeout=1)
+            self.wait(timeout=10)
         except KeyboardInterrupt:
             print(f"KeyboardInterrupt: force-killing workers of task {self}...", file=sys.stderr)
             for c in self.worker_pids:
