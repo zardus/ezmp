@@ -74,7 +74,11 @@ def wait():
         t.wait()
 
 class Task():
-    def __init__(self, noop=False, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False, atexit=None): #pylint:disable=redefined-outer-name
+    def __init__(
+        self,
+        noop=False, run_parent=False, wait=False, workers=1,
+        timeout=None, buffer_output=False, atexit=None, silence_successes=False
+    ): #pylint:disable=redefined-outer-name
         """
         Conditionally runs inner code.
 
@@ -84,6 +88,8 @@ class Task():
         :param wait: Wait for completion (default False)
         :param timeout: Timeout before workers are terminated (default None)
         :param buffer_output: Buffer stdout and print it out when the worker exits.
+        :param atexit: Run this function as the task exits.
+        :param silence_successes: When using buffered output, only emit tasks that throw exceptions.
 
         The timeout argument is mutually exclusive with wait and run_parent.
         """
@@ -101,6 +107,7 @@ class Task():
         self.worker_id = -1
         self.worker_pid = None
         self.buffer_output = buffer_output
+        self.silence_successes = silence_successes
         self.noop = noop
         self.atexit = atexit
 
@@ -160,7 +167,7 @@ class Task():
                 if exc_type not in (None, EZMPTerm, EZMPSkip):
                     traceback.print_exception(exc_type, value, tb)
             finally:
-                self.worker_finish()
+                self.worker_finish(exc_type=exc_type, exc_value=value, exc_tb=tb)
 
         if self.is_parent and self.timeout:
             try:
@@ -186,11 +193,11 @@ class Task():
         if issubclass(exc_type, EZMPSkip):
             return True
 
-    def worker_finish(self, sig=None, frame=None): #pylint:disable=unused-argument
+    def worker_finish(self, sig=None, frame=None, exc_type=None, exc_value=None, exc_tb=None): #pylint:disable=unused-argument
         try:
             if self.atexit:
                 self.atexit()
-            if self.buffer_output:
+            if self.buffer_output and not (self.silence_successes and exc_type is None):
                 print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
             _LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
         except: #pylint:disable=bare-except
