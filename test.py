@@ -1,4 +1,5 @@
 import tempfile
+import logging
 import psutil
 import time
 import ezmp
@@ -13,11 +14,10 @@ def test_sleep():
 	def bgtest():
 		time.sleep(10000)
 
-	sleep_pid = bgtest()
-	os.kill(sleep_pid, 0)
-	os.kill(sleep_pid, 9)
+	sleep_task = bgtest()
+	sleep_task.terminate()
 
-	sleep_pid = bgtest()
+	sleep_task = bgtest()
 	ezmp.cleanup()
 
 def test_background_loop():
@@ -113,6 +113,22 @@ def test_stress():
 	t.terminate()
 	assert not psutil.Process(os.getpid()).children()
 
+def test_atexit():
+	print("atexit testing")
+	f = tempfile.mktemp()
+	open(f, "w").close()
+	assert os.path.exists(f)
+
+	def ul():
+		os.unlink(f)
+
+	with ezmp.Task(atexit=ul) as t:
+		time.sleep(100)
+	assert psutil.Process(os.getpid()).children()
+	t.terminate()
+	assert not psutil.Process(os.getpid()).children()
+	assert not os.path.exists(f)
+
 def test_noop():
 	a = 1
 	with ezmp.Task(noop=True):
@@ -120,7 +136,11 @@ def test_noop():
 	assert a == 2
 
 if __name__ == '__main__':
+	logging.basicConfig()
 	test_sleep()
 	test_context_manager()
 	test_stress()
+	test_atexit()
 	test_noop()
+
+	print("done")

@@ -4,10 +4,9 @@ import traceback
 import logging
 import signal
 import atexit
-#import psutil
+import psutil
 import time
 import sys
-import gc
 import os
 import io
 
@@ -20,7 +19,7 @@ def backgrounded(func):
 	def _backgrounded(): #pylint:disable=inconsistent-return-statements
 		with Task() as t:
 			func()
-		return t.worker_pids[0]
+		return t
 	return _backgrounded
 
 def loop(func):
@@ -42,7 +41,8 @@ def cleanup():
 		return
 
 	for t in active_tasks:
-		t.terminate()
+		if t.worker_pids:
+			t.terminate()
 
 def worker_term(sig, frame):
 	raise EZMPTerm()
@@ -73,7 +73,7 @@ def wait():
 		t.wait()
 
 class Task():
-	def __init__(self, noop=False, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False): #pylint:disable=redefined-outer-name
+	def __init__(self, noop=False, run_parent=False, wait=False, workers=1, timeout=None, buffer_output=False, atexit=None): #pylint:disable=redefined-outer-name
 		"""
 		Conditionally runs inner code.
 
@@ -101,6 +101,7 @@ class Task():
 		self.worker_pid = None
 		self.buffer_output = buffer_output
 		self.noop = noop
+		self.atexit = atexit
 
 		if not noop:
 			active_tasks.append(self)
@@ -125,8 +126,8 @@ class Task():
 
 		if not self.is_parent:
 			self.worker_pids.clear()
-			signal.signal(signal.SIGUSR1, worker_term)
-			signal.signal(signal.SIGTERM, worker_term)
+			signal.signal(signal.SIGUSR1, self.worker_finish)
+			signal.signal(signal.SIGTERM, self.worker_finish)
 			signal.signal(signal.SIGINT, signal.SIG_IGN)
 			if self.buffer_output:
 				sys.stdout = io.StringIO()
@@ -151,16 +152,7 @@ class Task():
 
 			if exc_type not in (None, EZMPTerm, EZMPSkip):
 				traceback.print_exception(exc_type, value, tb)
-			if exc_type:
-				_LOG.debug("Worker ID %d PID %d got exception type %s", self.worker_id, self.worker_pid, exc_type)
-				# deallocate stuff hanging on the exception context
-				del exc_type
-				gc.collect()
-
-			if self.buffer_output:
-				print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
-			_LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
-			os.kill(self.worker_pid, 9)
+			self.worker_finish()
 
 		if self.is_parent and self.timeout:
 			try:
@@ -186,25 +178,33 @@ class Task():
 		if issubclass(exc_type, EZMPSkip):
 			return True
 
+	def worker_finish(self, sig=None, frame=None): #pylint:disable=unused-argument
+		if self.atexit:
+			self.atexit()
+		if self.buffer_output:
+			print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
+		_LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
+		os.kill(self.worker_pid, 9)
+
 	def terminate(self):
-		_LOG.debug("Terminating %s (parent PID %s).", self, os.getpid())
-		# send all the kill signals
-		for c in self.worker_pids:
-			with contextlib.suppress(ProcessLookupError):
-				os.kill(c, signal.SIGUSR1)
+		try:
+			_LOG.debug("Terminating %s...", self)
+			for c in self.worker_pids:
+				_LOG.debug("... terminating %s child PID %s", self, c)
+				with contextlib.suppress(ProcessLookupError):
+					os.kill(c, signal.SIGUSR1)
 
-		# let's get nasty after a second
-		#time.sleep(1)
-		#for c in self.worker_pids:
-		#	with contextlib.suppress(ProcessLookupError):
-		#		child = psutil.Process(c)
-		#		for descendent in child.children(recursive=True):
-		#			descendent.kill()
-		#		os.kill(c, signal.SIGUSR1)
-
-		self.wait(timeout=1)
-		if self.worker_pids:
-			self.terminate()
+			self.wait(timeout=1)
+			if self.worker_pids:
+				self.terminate()
+		except KeyboardInterrupt:
+			for c in self.worker_pids:
+				with contextlib.suppress(ProcessLookupError):
+					child = psutil.Process(c)
+					for descendent in child.children(recursive=True):
+						descendent.kill()
+					child.kill()
+			raise
 
 	def wait(self, timeout=None):
 		if timeout:
