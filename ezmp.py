@@ -168,8 +168,13 @@ class Task():
                     traceback.print_exception(exc_type, value, tb)
             finally:
                 self.worker_finish(exc_type=exc_type, exc_value=value, exc_tb=tb)
+                _LOG.critical("THIS SHOULD NOT BE REACHED")
+                os.kill(self.worker_pid, 9)
+                _LOG.critical("THIS SHOULD **REALLY** NOT BE REACHED")
 
-        if self.is_parent and self.timeout:
+        assert self.is_parent
+
+        if self.timeout:
             try:
                 time.sleep(self.timeout)
                 _LOG.debug("Timeout reached. Terminating workers.")
@@ -179,7 +184,7 @@ class Task():
 
             self.terminate()
 
-        if self.is_parent and self._wait:
+        if self._wait:
             _LOG.debug("Waiting for workers.")
             try:
                 self.wait()
@@ -204,6 +209,7 @@ class Task():
             traceback.print_exc()
         finally:
             os.kill(self.worker_pid, 9)
+            _LOG.critical("THIS SHOULD **REALLY** NOT BE REACHED")
 
     def terminate(self):
         try:
