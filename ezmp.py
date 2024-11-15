@@ -114,7 +114,11 @@ class Task():
 
         self.is_parent = True
         for i in range(self.num_workers):
-            await_availability(1)
+            try:
+                await_availability(1)
+            except KeyboardInterrupt:
+                self.terminate()
+                raise
             pid = os.fork()
             if pid:
                 self.worker_pids.append(pid)
@@ -147,12 +151,14 @@ class Task():
             return
 
         if not self.is_parent:
-            signal.signal(signal.SIGUSR1, signal.SIG_IGN)
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            try:
+                signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
-            if exc_type not in (None, EZMPTerm, EZMPSkip):
-                traceback.print_exception(exc_type, value, tb)
-            self.worker_finish()
+                if exc_type not in (None, EZMPTerm, EZMPSkip):
+                    traceback.print_exception(exc_type, value, tb)
+            finally:
+                self.worker_finish()
 
         if self.is_parent and self.timeout:
             try:
@@ -179,25 +185,29 @@ class Task():
             return True
 
     def worker_finish(self, sig=None, frame=None): #pylint:disable=unused-argument
-        if self.atexit:
-            self.atexit()
-        if self.buffer_output:
-            print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
-        _LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
-        os.kill(self.worker_pid, 9)
+        try:
+            if self.atexit:
+                self.atexit()
+            if self.buffer_output:
+                print(sys.stdout.getvalue(), end="", file=sys.__stdout__)
+            _LOG.debug("Worker ID %d PID %d terminating.", self.worker_id, self.worker_pid)
+        except: #pylint:disable=bare-except
+            traceback.print_exc()
+        finally:
+            os.kill(self.worker_pid, 9)
 
     def terminate(self):
         try:
             _LOG.debug("Terminating %s...", self)
+            print(f"Terminating task {self}. One more SIGINT to force-kill.", file=sys.stderr)
             for c in self.worker_pids:
                 _LOG.debug("... terminating %s child PID %s", self, c)
                 with contextlib.suppress(ProcessLookupError):
                     os.kill(c, signal.SIGUSR1)
 
             self.wait(timeout=1)
-            if self.worker_pids:
-                self.terminate()
         except KeyboardInterrupt:
+            print(f"KeyboardInterrupt: force-killing workers of task {self}...", file=sys.stderr)
             for c in self.worker_pids:
                 with contextlib.suppress(ProcessLookupError):
                     child = psutil.Process(c)
@@ -205,6 +215,9 @@ class Task():
                         descendent.kill()
                     child.kill()
             raise
+
+        if self.worker_pids:
+            self.terminate()
 
     def wait(self, timeout=None):
         if timeout:
